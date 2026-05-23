@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
 from sklearn.preprocessing import LabelEncoder
+from scipy.stats.mstats import winsorize as _winsorize
 import lightgbm as lgb
 import io
 import warnings
@@ -265,17 +266,26 @@ def detect_columns(cols: list) -> dict:
     }
 
 
-def engineer_features(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
-    """Конструирование признаков — повторяет логику из ноутбука"""
+def engineer_features(df: pd.DataFrame, col_map: dict):
+    """
+    Конструирование признаков.
+    ИЗМЕНЕНИЯ vs оригинал:
+      - sales_qty_clean: winsorize 95-й перцентиль по каждому SKU
+      - is_outlier: флаг что точка была выбросом
+      - все лаги и rolling строятся на ЧИСТЫХ продажах
+    """
     d = pd.DataFrame()
 
     # Базовые колонки
-    d["sku"]      = df[col_map["sku"]].astype(str) if col_map.get("sku") else "default"
-    d["name"]     = df[col_map["name"]].astype(str) if col_map.get("name") else d["sku"]
+    d["sku"] = df[col_map["sku"]].astype(str) if col_map.get("sku") else "default"
+    d["name"] = df[col_map["name"]].astype(str) if col_map.get("name") else d["sku"]
     d["subgroup"] = df[col_map["subgroup"]].astype(str) if col_map.get("subgroup") else "default"
-    d["date"]     = pd.to_datetime(df[col_map["date"]], dayfirst=True, errors="coerce") if col_map.get("date") else pd.Timestamp("2023-01-01")
+    d["date"] = (
+        pd.to_datetime(df[col_map["date"]], dayfirst=True, errors="coerce")
+        if col_map.get("date") else pd.Timestamp("2023-01-01")
+    )
 
-    # Продажи
+    # ── Продажи ──────────────────────────────────────────────────────────────
     if col_map.get("sales_qty"):
         d["sales_qty"] = pd.to_numeric(df[col_map["sales_qty"]], errors="coerce").fillna(0)
     elif col_map.get("sales_tg"):
@@ -283,23 +293,38 @@ def engineer_features(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
     else:
         raise ValueError("Не выбрана колонка с продажами!")
 
+    # ── НОВОЕ: очистка выбросов winsorize (95-й перцентиль по SKU) ───────────
+    def _winsorize_group(x):
+        q95 = x.quantile(0.95)
+        return x.clip(upper=q95)
+
+    d["sales_qty_clean"] = (
+        d.groupby("sku")["sales_qty"]
+        .transform(_winsorize_group)
+    )
+    # Флаг: точка была аномалией
+    d["is_outlier"] = (d["sales_qty"] > d["sales_qty_clean"]).astype(int)
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Опциональные колонки
-    for key, default in [("rc_price", np.nan), ("promo_flag", 0), ("stock", 0),
-                          ("holiday_days", 0), ("ramadan_flag", 0),
-                          ("promo_count", 0), ("receipts_qty", 0), ("oos_flag", 0)]:
+    for key, default in [
+        ("rc_price", np.nan), ("promo_flag", 0), ("stock", 0),
+        ("holiday_days", 0), ("ramadan_flag", 0),
+        ("promo_count", 0), ("receipts_qty", 0), ("oos_flag", 0),
+    ]:
         if col_map.get(key):
             d[key] = pd.to_numeric(df[col_map[key]], errors="coerce").fillna(default)
         else:
             d[key] = default
 
-    # Заполняем цену медианой
+    # Цена — заполняем медианой
     price_med = d["rc_price"].median() if d["rc_price"].notna().any() else 1.0
     d["rc_price_missing_flag"] = d["rc_price"].isna().astype(int)
     d["rc_price"] = d["rc_price"].fillna(price_med)
 
     # Временны́е признаки
-    d["month"]   = d["date"].dt.month
-    d["year"]    = d["date"].dt.year
+    d["month"] = d["date"].dt.month
+    d["year"] = d["date"].dt.year
     d["quarter"] = d["date"].dt.quarter
     d["month_sin"] = np.sin(2 * np.pi * d["month"] / 12)
     d["month_cos"] = np.cos(2 * np.pi * d["month"] / 12)
@@ -308,46 +333,45 @@ def engineer_features(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
     min_month = d.loc[d["year"] == min_year, "month"].min()
     d["trend_index"] = (d["year"] - min_year) * 12 + (d["month"] - min_month)
 
-    # Сортировка
     d = d.sort_values(["sku", "date"]).reset_index(drop=True)
 
     # Label encoding
     le_sku = LabelEncoder()
     le_sub = LabelEncoder()
-    d["sku_encoded"]      = le_sku.fit_transform(d["sku"].astype(str))
+    d["sku_encoded"] = le_sku.fit_transform(d["sku"].astype(str))
     d["subgroup_encoded"] = le_sub.fit_transform(d["subgroup"].astype(str))
 
-    # Статистики по SKU
-    d["sku_mean_sales"]      = d.groupby("sku")["sales_qty"].transform("mean")
-    d["subgroup_mean_sales"] = d.groupby("subgroup")["sales_qty"].transform("mean")
+    # Статистики (на ЧИСТЫХ продажах)
+    d["sku_mean_sales"] = d.groupby("sku")["sales_qty_clean"].transform("mean")
+    d["subgroup_mean_sales"] = d.groupby("subgroup")["sales_qty_clean"].transform("mean")
 
     # Ценовые признаки
-    d["price_ratio"]   = d["rc_price"] / d.groupby("sku")["rc_price"].transform("mean").replace(0, 1)
-    d["price_lag_1"]   = d.groupby("sku")["rc_price"].shift(1).fillna(d["rc_price"])
-    d["price_change_1"]= d["rc_price"] - d["price_lag_1"]
+    d["price_ratio"] = d["rc_price"] / d.groupby("sku")["rc_price"].transform("mean").replace(0, 1)
+    d["price_lag_1"] = d.groupby("sku")["rc_price"].shift(1).fillna(d["rc_price"])
+    d["price_change_1"] = d["rc_price"] - d["price_lag_1"]
     d["price_x_promo"] = d["rc_price"] * d["promo_flag"]
     d["stock_x_promo"] = d["stock"] * d["promo_flag"]
 
-    # Лаговые признаки — из ноутбука
+    # ── Лаги — строим на ЧИСТЫХ продажах ────────────────────────────────────
     for lag in [1, 2, 3, 6, 12]:
-        d[f"lag_{lag}"] = d.groupby("sku")["sales_qty"].shift(lag).fillna(0)
+        d[f"lag_{lag}"] = d.groupby("sku")["sales_qty_clean"].shift(lag).fillna(0)
 
-    # Скользящие средние
     for w in [3, 6, 12]:
         d[f"rolling_mean_{w}"] = (
-            d.groupby("sku")["sales_qty"]
+            d.groupby("sku")["sales_qty_clean"]
             .transform(lambda x: x.shift(1).rolling(w, min_periods=1).mean())
             .fillna(0)
         )
+    # ─────────────────────────────────────────────────────────────────────────
 
     d["sales_diff_1"] = d["lag_1"] - d["lag_2"]
-    d["sales_trend"]  = d.groupby("sku")["sales_qty"].diff().fillna(0)
+    d["sales_trend"] = d.groupby("sku")["sales_qty_clean"].diff().fillna(0)
     d["stock_to_roll3"] = d["stock"] / (d["rolling_mean_3"] + 1)
-    d["received_flag"]  = (d["receipts_qty"] > 0).astype(int)
+    d["received_flag"] = (d["receipts_qty"] > 0).astype(int)
     d["low_stock_flag"] = (d["stock"] <= 5).astype(int)
 
-    # Целевая переменная
-    d["target"] = np.log1p(d["sales_qty"])
+    # Целевая переменная — на ЧИСТЫХ продажах
+    d["target"] = np.log1p(d["sales_qty_clean"])
 
     return d, le_sku, le_sub, price_med
 
@@ -437,9 +461,39 @@ def train_model(df: pd.DataFrame, progress_bar):
     return model, metrics, feat_imp, test_df, feats
 
 
-def make_forecast(model, df: pd.DataFrame, feats: list,
-                  sku_filter: str, horizon: int) -> pd.DataFrame:
-    """Итеративный прогноз на horizon месяцев вперёд"""
+REAL_HOLIDAY_DAYS = {
+    "Казахстан": {1: 2, 3: 4, 5: 3, 7: 1, 8: 1, 10: 1, 12: 2},
+    "Россия": {1: 8, 2: 1, 3: 1, 5: 2, 6: 1, 11: 1},
+    "Германия": {1: 1, 5: 1, 10: 1, 12: 2},
+    "Узбекистан": {1: 1, 3: 2, 5: 1, 9: 1, 10: 1, 12: 1},
+}
+
+REAL_RAMADAN_MONTHS = {
+    2024: 3,  # март 2024
+    2025: 3,  # март 2025
+    2026: 2,  # февраль 2026
+}
+
+
+def make_forecast(
+        model,
+        df: pd.DataFrame,
+        feats: list,
+        sku_filter: str,
+        horizon: int,
+        country: str = "Казахстан",  # ← NEW: передавай из session_state.company
+) -> pd.DataFrame:
+    """
+    Итеративный прогноз на horizon месяцев вперёд.
+    ИЗМЕНЕНИЯ:
+      - holiday_days берётся из реального словаря, не захардкожен
+      - ramadan_flag берётся из реального словаря дат
+      - pred ограничен cap = исторический 97-й перцентиль × 1.3
+      - лаги строятся на sales_qty_clean если есть, иначе sales_qty
+    """
+    holidays_map = REAL_HOLIDAY_DAYS.get(country, REAL_HOLIDAY_DAYS["Казахстан"])
+    sales_col = "sales_qty_clean" if "sales_qty_clean" in df.columns else "sales_qty"
+
     skus = df["sku"].unique().tolist() if sku_filter == "Все SKU" else [sku_filter]
     results = []
 
@@ -448,72 +502,100 @@ def make_forecast(model, df: pd.DataFrame, feats: list,
         if sku_df.empty:
             continue
 
-        hist = sku_df["sales_qty"].tolist()
+        # ── Cap: не давать прогнозу улететь выше исторического максимума ──
+        sku_cap = sku_df[sales_col].quantile(0.97) * 1.3
+        if sku_cap < 1:
+            sku_cap = sku_df[sales_col].max() * 1.5  # запасной вариант
+
+        hist = sku_df[sales_col].tolist()
         last_row = sku_df.iloc[-1].copy()
         last_date = sku_df["date"].max()
 
         for h in range(1, horizon + 1):
             next_date = last_date + pd.DateOffset(months=h)
-            month  = next_date.month
-            year   = next_date.year
+            month = next_date.month
+            year = next_date.year
 
-            lag1  = hist[-1]  if len(hist) >= 1  else 0
-            lag2  = hist[-2]  if len(hist) >= 2  else 0
-            lag3  = hist[-3]  if len(hist) >= 3  else 0
-            lag6  = hist[-6]  if len(hist) >= 6  else 0
+            lag1 = hist[-1] if len(hist) >= 1 else 0
+            lag2 = hist[-2] if len(hist) >= 2 else 0
+            lag3 = hist[-3] if len(hist) >= 3 else 0
+            lag6 = hist[-6] if len(hist) >= 6 else 0
             lag12 = hist[-12] if len(hist) >= 12 else 0
-            roll3  = np.mean(hist[-3:])  if hist else 0
-            roll6  = np.mean(hist[-6:])  if hist else 0
+            roll3 = np.mean(hist[-3:]) if hist else 0
+            roll6 = np.mean(hist[-6:]) if hist else 0
             roll12 = np.mean(hist[-12:]) if hist else 0
 
             row = {
-                "sku_encoded":       last_row.get("sku_encoded", 0),
-                "subgroup_encoded":  last_row.get("subgroup_encoded", 0),
-                "month": month, "quarter": (month - 1) // 3 + 1,
+                "sku_encoded": last_row.get("sku_encoded", 0),
+                "subgroup_encoded": last_row.get("subgroup_encoded", 0),
+                "month": month,
+                "quarter": (month - 1) // 3 + 1,
                 "year": year,
                 "month_sin": np.sin(2 * np.pi * month / 12),
                 "month_cos": np.cos(2 * np.pi * month / 12),
                 "trend_index": last_row.get("trend_index", 0) + h,
-                "lag_1": lag1, "lag_2": lag2, "lag_3": lag3,
-                "lag_6": lag6, "lag_12": lag12,
-                "rolling_mean_3": roll3, "rolling_mean_6": roll6, "rolling_mean_12": roll12,
+                "lag_1": lag1,
+                "lag_2": lag2,
+                "lag_3": lag3,
+                "lag_6": lag6,
+                "lag_12": lag12,
+                "rolling_mean_3": roll3,
+                "rolling_mean_6": roll6,
+                "rolling_mean_12": roll12,
                 "sales_diff_1": lag1 - lag2,
                 "rc_price": last_row.get("rc_price", 1),
                 "rc_price_missing_flag": last_row.get("rc_price_missing_flag", 0),
                 "price_lag_1": last_row.get("rc_price", 1),
                 "price_change_1": 0,
-                "promo_flag": 0, "promo_count": 0,
+                "promo_flag": 0,
+                "promo_count": 0,
                 "stock": last_row.get("stock", 0),
-                "receipts_qty": 0, "received_flag": 0,
+                "receipts_qty": 0,
+                "received_flag": 0,
                 "low_stock_flag": 0,
                 "stock_to_roll3": last_row.get("stock", 0) / (roll3 + 1),
-                "holiday_days": 3 if month in [1, 3, 5, 7, 9] else 0,
-                "ramadan_flag": 1 if month == 3 else 0,
-                "price_x_promo": 0, "stock_x_promo": 0,
+                # ── ИСПРАВЛЕНО: реальные праздники ──────────────────────────
+                "holiday_days": holidays_map.get(month, 0),
+                "ramadan_flag": 1 if REAL_RAMADAN_MONTHS.get(year) == month else 0,
+                # ────────────────────────────────────────────────────────────
+                "price_x_promo": 0,
+                "stock_x_promo": 0,
                 "sku_mean_sales": last_row.get("sku_mean_sales", 0),
                 "subgroup_mean_sales": last_row.get("subgroup_mean_sales", 0),
                 "sales_trend": lag1 - lag2,
+                "is_outlier": 0,  # для будущего прогноза всегда 0
             }
 
             X = pd.DataFrame([row])[[f for f in feats if f in row]].fillna(0)
             pred_log = model.predict(X)[0]
             pred = max(0, np.expm1(pred_log))
 
+            # ── ИСПРАВЛЕНО: cap на рост ──────────────────────────────────────
+            pred = min(pred, sku_cap)
+            # ────────────────────────────────────────────────────────────────
+
+            # Динамический интервал: шире для дальних горизонтов
+            uncertainty = 0.08 + h * 0.01  # 9% на 1 мес, 18% на 10 мес
+
             results.append({
-                "sku": sku, "date": next_date,
+                "sku": sku,
+                "date": next_date,
                 "predicted": round(pred),
-                "lower": round(pred * 0.88),
-                "upper": round(pred * 1.12),
+                "lower": round(pred * (1 - uncertainty)),
+                "upper": round(pred * (1 + uncertainty)),
             })
             hist.append(pred)
 
     result_df = pd.DataFrame(results)
+
     if sku_filter == "Все SKU" and not result_df.empty:
-        result_df = result_df.groupby("date").agg(
-            predicted=("predicted", "sum"),
-            lower=("lower", "sum"),
-            upper=("upper", "sum"),
-        ).reset_index()
+        result_df = (
+            result_df.groupby("date")
+            .agg(predicted=("predicted", "sum"),
+                 lower=("lower", "sum"),
+                 upper=("upper", "sum"))
+            .reset_index()
+        )
         result_df["sku"] = "Все SKU"
 
     return result_df
@@ -892,27 +974,73 @@ elif page == "🤖 Обучение модели":
 # ═══════════════════════════════════════════════════════════════════════════════
 # СТРАНИЦА 4 — ПРОГНОЗ
 # ═══════════════════════════════════════════════════════════════════════════════
+def build_sku_name_map(df: pd.DataFrame) -> dict:
+    """
+    Строит словарь {sku_code: product_name} из датафрейма.
+    Берёт первое встреченное название для каждого SKU.
+    """
+    if "name" not in df.columns:
+        return {}
+    return (
+        df[["sku", "name"]]
+        .drop_duplicates(subset="sku")
+        .set_index("sku")["name"]
+        .to_dict()
+    )
+
+
+def format_sku_label(sku: str, sku_name_map: dict, max_len: int = 45) -> str:
+    """
+    Возвращает строку вида:
+      '111615 · Мороженое ассорти 500г'
+    или просто '111615' если названия нет.
+    """
+    if sku == "Все SKU":
+        return "Все SKU"
+    name = sku_name_map.get(sku, "")
+    if not name or name == sku:
+        return sku
+    label = f"{sku} · {name}"
+    return label[:max_len] + "…" if len(label) > max_len else label
+
 elif page == "🔮 Прогноз":
     if st.session_state.model is None:
         st.warning("Сначала обучите модель в разделе **🤖 Обучение модели**")
         st.stop()
 
-    df       = st.session_state.df_eng
-    model    = st.session_state.model
-    feats    = st.session_state.feats
+    df = st.session_state.df_eng
+    model = st.session_state.model
+    feats = st.session_state.feats
 
-    styled_header("Прогноз продаж", "Прогнозы LightGBM с учётом лагов, сезонности и ценовых факторов.")
+    styled_header("Прогноз продаж",
+                  "Прогнозы LightGBM с учётом лагов, сезонности и ценовых факторов.")
 
-    # Панель управления
+    # ── Словарь SKU → Название ──────────────────────────────────────────────
+    sku_name_map = build_sku_name_map(df)
+    all_skus = sorted(df["sku"].unique().tolist())
+
+    # Список для dropdown: "111615 · Название товара"
+    sku_display_options = ["Все SKU"] + [
+        format_sku_label(s, sku_name_map) for s in all_skus
+    ]
+    # Обратный маппинг: display_label → sku_code
+    display_to_sku = {"Все SKU": "Все SKU"}
+    display_to_sku.update({
+        format_sku_label(s, sku_name_map): s for s in all_skus
+    })
+
+    # ── Панель управления ───────────────────────────────────────────────────
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
-        sku_options = ["Все SKU"] + sorted(df["sku"].unique().tolist())
-        sku_filter  = st.selectbox("SKU / Продукт", sku_options)
+        selected_display = st.selectbox("SKU / Продукт", sku_display_options)
+        sku_filter = display_to_sku[selected_display]
+
     with c2:
-        horizon = st.selectbox("Горизонт прогноза",
+        horizon = st.selectbox(
+            "Горизонт прогноза",
             [1, 2, 3, 6, 9, 12],
             index=3,
-            format_func=lambda m: f"{m} мес." if m > 1 else "1 месяц"
+            format_func=lambda m: f"{m} мес." if m > 1 else "1 месяц",
         )
     with c3:
         st.markdown("<br>", unsafe_allow_html=True)
@@ -920,23 +1048,34 @@ elif page == "🔮 Прогноз":
 
     if run:
         with st.spinner("Генерация прогноза..."):
-            forecast_df = make_forecast(model, df, feats, sku_filter, horizon)
+            country = getattr(st.session_state.get("company", {}), "get", lambda k, d=None: d)("country", "Казахстан")
+            forecast_df = make_forecast(model, df, feats, sku_filter, horizon, country)
             st.session_state["forecast_df"] = forecast_df
+            st.session_state["forecast_sku"] = sku_filter
 
     if "forecast_df" in st.session_state and st.session_state.forecast_df is not None:
         forecast_df = st.session_state.forecast_df
+        shown_sku = st.session_state.get("forecast_sku", sku_filter)
 
-        # История + прогноз на графике
-        if sku_filter == "Все SKU":
-            hist_df = df.groupby("date")["sales_qty"].sum().reset_index()
+        # Человекочитаемый заголовок
+        if shown_sku == "Все SKU":
+            human_title = "Все SKU (суммарно)"
         else:
-            hist_df = df[df["sku"] == sku_filter].groupby("date")["sales_qty"].sum().reset_index()
+            human_title = format_sku_label(shown_sku, sku_name_map)
+
+        # ── История ─────────────────────────────────────────────────────────
+        sales_col = "sales_qty_clean" if "sales_qty_clean" in df.columns else "sales_qty"
+        if shown_sku == "Все SKU":
+            hist_df = df.groupby("date")[sales_col].sum().reset_index()
+        else:
+            hist_df = df[df["sku"] == shown_sku].groupby("date")[sales_col].sum().reset_index()
 
         hist_df = hist_df.sort_values("date").tail(18)
+        hist_df.rename(columns={sales_col: "sales_qty"}, inplace=True)
 
+        # ── График ──────────────────────────────────────────────────────────
         fig = go.Figure()
 
-        # История
         fig.add_trace(go.Scatter(
             x=hist_df["date"], y=hist_df["sales_qty"],
             mode="lines+markers", name="История",
@@ -944,16 +1083,14 @@ elif page == "🔮 Прогноз":
             marker=dict(size=5, color="#2dd4bf"),
         ))
 
-        # Доверительный интервал
         fig.add_trace(go.Scatter(
             x=pd.concat([forecast_df["date"], forecast_df["date"][::-1]]),
             y=pd.concat([forecast_df["upper"], forecast_df["lower"][::-1]]),
             fill="toself", fillcolor="rgba(79,140,255,0.1)",
             line=dict(color="rgba(0,0,0,0)"),
-            name="Интервал ±12%", showlegend=True,
+            name="Доверительный интервал",
         ))
 
-        # Прогноз
         fig.add_trace(go.Scatter(
             x=forecast_df["date"], y=forecast_df["predicted"],
             mode="lines+markers", name="Прогноз",
@@ -961,44 +1098,107 @@ elif page == "🔮 Прогноз":
             marker=dict(size=7, color="#4f8cff"),
         ))
 
-        # Вертикальная линия разделения
-        split_date = hist_df["date"].max()
-        fig.add_vline(x=split_date, line_dash="dot",
-                      line_color="rgba(255,255,255,0.2)", line_width=1)
+        fig.add_vline(
+            x=hist_df["date"].max(),
+            line_dash="dot",
+            line_color="rgba(255,255,255,0.2)",
+            line_width=1,
+        )
 
-        plotly_dark_layout(fig, f"{'Все SKU' if sku_filter=='Все SKU' else sku_filter} — прогноз на {horizon} мес.", height=380)
+        plotly_dark_layout(
+            fig,
+            f"{human_title} — прогноз на {horizon} мес.",
+            height=380,
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Таблица прогноза
-        st.markdown('<div style="font-weight:500; margin-bottom:12px; color:#e8eaf0;">Помесячная разбивка</div>', unsafe_allow_html=True)
+        # ── Карточка "Почему такой прогноз" ─────────────────────────────────
+        if shown_sku != "Все SKU":
+            sku_hist = df[df["sku"] == shown_sku][sales_col]
+            last3 = sku_hist.tail(3).mean()
+            prev3 = sku_hist.tail(6).head(3).mean()
+            trend_pct = ((last3 - prev3) / (prev3 + 1)) * 100
 
-        table_data = forecast_df[["date","predicted","lower","upper"]].copy()
-        table_data["date"]      = table_data["date"].dt.strftime("%Y-%m")
+            monthly_avg = df[df["sku"] == shown_sku].groupby("month")[sales_col].mean()
+            peak_month = monthly_avg.idxmax() if not monthly_avg.empty else None
+            months_ru = ["", "янв", "фев", "мар", "апр", "май", "июн",
+                         "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+            outlier_count = int(df[df["sku"] == shown_sku].get("is_outlier", pd.Series([0])).sum())
+
+            trend_icon = "📈" if trend_pct > 0 else "📉"
+            trend_color = "#34d399" if trend_pct > 0 else "#f87171"
+
+            st.markdown(f"""
+            <div style="margin: 16px 0; padding: 16px 20px; background: #161920;
+                        border: 1px solid rgba(255,255,255,0.07); border-radius: 12px;">
+                <div style="font-weight:500; margin-bottom:12px; color:#e8eaf0;">
+                    💡 Почему такой прогноз?
+                </div>
+                <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; font-size:13px;">
+                    <div>
+                        <span style="color:#555b70;">{trend_icon} Тренд (3 мес.)</span><br>
+                        <span style="color:{trend_color}; font-weight:600;">
+                            {trend_pct:+.1f}%
+                        </span> к предыдущему периоду
+                    </div>
+                    <div>
+                        <span style="color:#555b70;">🗓 Сезонный пик</span><br>
+                        <span style="color:#e8eaf0; font-weight:600;">
+                            {months_ru[peak_month] if peak_month else "—"}
+                        </span> — исторически лучший месяц
+                    </div>
+                    <div>
+                        <span style="color:#555b70;">⚠️ Аномалии в истории</span><br>
+                        <span style="color:{"#fbbf24" if outlier_count > 0 else "#34d399"}; font-weight:600;">
+                            {outlier_count} точек
+                        </span> {"сглажено перед обучением" if outlier_count > 0 else "не обнаружено"}
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── Таблица ─────────────────────────────────────────────────────────
+        st.markdown(
+            '<div style="font-weight:500; margin-bottom:12px; color:#e8eaf0;">'
+            'Помесячная разбивка</div>',
+            unsafe_allow_html=True,
+        )
+
+        table_data = forecast_df[["date", "predicted", "lower", "upper"]].copy()
+        table_data["date"] = table_data["date"].dt.strftime("%Y-%m")
         table_data["predicted"] = table_data["predicted"].apply(lambda x: f"{int(x):,}")
-        table_data["lower"]     = table_data["lower"].apply(lambda x: f"{int(x):,}")
-        table_data["upper"]     = table_data["upper"].apply(lambda x: f"{int(x):,}")
-        table_data.columns      = ["Месяц", "Прогноз (ед.)", "Нижняя граница (−12%)", "Верхняя граница (+12%)"]
+        table_data["lower"] = table_data["lower"].apply(lambda x: f"{int(x):,}")
+        table_data["upper"] = table_data["upper"].apply(lambda x: f"{int(x):,}")
+        # Добавляем название
+        table_data.insert(0, "Продукт", human_title if shown_sku != "Все SKU" else "Все SKU")
+        table_data.columns = ["Продукт", "Месяц", "Прогноз (ед.)",
+                              "Нижняя граница", "Верхняя граница"]
 
         st.dataframe(table_data, use_container_width=True, hide_index=True)
 
-        # Экспорт
+        # ── Экспорт ─────────────────────────────────────────────────────────
         csv_out = forecast_df.copy()
+        csv_out["product_name"] = sku_name_map.get(shown_sku, shown_sku)
         csv_out["date"] = csv_out["date"].dt.strftime("%Y-%m")
         csv_bytes = csv_out.to_csv(index=False).encode("utf-8")
+
         st.download_button(
             "⬇ Скачать прогноз CSV",
             data=csv_bytes,
-            file_name=f"forecast_{sku_filter.replace(' ','_')}_{horizon}m.csv",
+            file_name=f"forecast_{shown_sku}_{horizon}m.csv",
             mime="text/csv",
         )
 
+        # ── Метаинфо ────────────────────────────────────────────────────────
         st.markdown(f"""
         <div style="margin-top:16px; padding:12px 16px; background:#161920;
                     border-radius:8px; border:1px solid rgba(255,255,255,0.07);
                     font-size:12px; color:#555b70;">
-            Прогноз построен на основе: лаговых признаков (lag1–lag12), скользящих средних (3/6/12 мес.),
-            сезонных кодировок, тренда, ценовых факторов и промо-активности.
+            Прогноз построен на основе: лаговых признаков (lag1–lag12), скользящих средних
+            (3/6/12 мес.), сезонных кодировок, тренда, ценовых факторов и промо-активности.
+            Выбросы сглажены до 95-го перцентиля по SKU.
             Модель: <span style="color:#4f8cff;">LightGBM</span> ·
             Признаков: <span style="color:#e8eaf0;">{len(feats)}</span>
         </div>
-        """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True
