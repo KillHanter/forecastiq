@@ -601,6 +601,31 @@ def make_forecast(
     return result_df
 
 
+# ─── Вспомогательные функции для SKU → Название ──────────────────────────────
+
+def build_sku_name_map(df: pd.DataFrame) -> dict:
+    """Строит словарь {sku_code: product_name} из датафрейма."""
+    if "name" not in df.columns:
+        return {}
+    return (
+        df[["sku", "name"]]
+        .drop_duplicates(subset="sku")
+        .set_index("sku")["name"]
+        .to_dict()
+    )
+
+
+def format_sku_label(sku: str, sku_name_map: dict, max_len: int = 45) -> str:
+    """Возвращает строку вида '111615 · Название товара'."""
+    if sku == "Все SKU":
+        return "Все SKU"
+    name = sku_name_map.get(sku, "")
+    if not name or name == sku:
+        return sku
+    label = f"{sku} · {name}"
+    return label[:max_len] + "…" if len(label) > max_len else label
+
+
 # ─── Сессионное состояние ──────────────────────────────────────────────────────
 for key in ["df_raw", "df_eng", "col_map", "model", "metrics",
             "feat_imp", "test_pred", "feats", "file_name"]:
@@ -974,35 +999,6 @@ elif page == "🤖 Обучение модели":
 # ═══════════════════════════════════════════════════════════════════════════════
 # СТРАНИЦА 4 — ПРОГНОЗ
 # ═══════════════════════════════════════════════════════════════════════════════
-def build_sku_name_map(df: pd.DataFrame) -> dict:
-    """
-    Строит словарь {sku_code: product_name} из датафрейма.
-    Берёт первое встреченное название для каждого SKU.
-    """
-    if "name" not in df.columns:
-        return {}
-    return (
-        df[["sku", "name"]]
-        .drop_duplicates(subset="sku")
-        .set_index("sku")["name"]
-        .to_dict()
-    )
-
-
-def format_sku_label(sku: str, sku_name_map: dict, max_len: int = 45) -> str:
-    """
-    Возвращает строку вида:
-      '111615 · Мороженое ассорти 500г'
-    или просто '111615' если названия нет.
-    """
-    if sku == "Все SKU":
-        return "Все SKU"
-    name = sku_name_map.get(sku, "")
-    if not name or name == sku:
-        return sku
-    label = f"{sku} · {name}"
-    return label[:max_len] + "…" if len(label) > max_len else label
-
 elif page == "🔮 Прогноз":
     if st.session_state.model is None:
         st.warning("Сначала обучите модель в разделе **🤖 Обучение модели**")
@@ -1202,3 +1198,4 @@ elif page == "🔮 Прогноз":
             Признаков: <span style="color:#e8eaf0;">{len(feats)}</span>
         </div>
         """, unsafe_allow_html=True
+        )
